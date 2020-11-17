@@ -1192,11 +1192,11 @@ fn translate_variable<'a>(
     id_defs: &mut GlobalStringIdResolver<'a>,
     var: ast::Variable<ast::VariableType, &'a str>,
 ) -> Result<ast::Variable<ast::VariableType, spirv::Word>, TranslateError> {
-    let (state_space, typ) = var.v_type.to_type();
+    let (_, typ) = var.v_type.to_type();
     Ok(ast::Variable {
         align: var.align,
         v_type: var.v_type,
-        name: id_defs.get_or_add_def_typed(var.name, (state_space.into(), typ)),
+        name: id_defs.get_or_add_def_typed(var.name, typ),
         array_init: var.array_init,
     })
 }
@@ -1218,10 +1218,8 @@ fn expand_kernel_params<'a, 'b>(
         Ok(ast::KernelArgument {
             name: fn_resolver.add_def(
                 a.name,
-                Some((
-                    StateSpace::Param,
-                    ast::Type::from(a.v_type.clone()).pointer_to(ast::LdStateSpace::Param)?,
-                )),
+                Some(ast::Type::from(a.v_type.clone()).pointer_to(ast::LdStateSpace::Param)?),
+                false, // This is debatable if should be true or false
             ),
             v_type: a.v_type.clone(),
             align: a.align,
@@ -1237,13 +1235,13 @@ fn expand_fn_params<'a, 'b>(
 ) -> Result<Vec<ast::FnArgument<spirv::Word>>, TranslateError> {
     args.map(|a| {
         let var_type = a.v_type.to_func_type();
-        let ss = match a.v_type {
-            ast::FnArgumentType::Reg(_) => StateSpace::Reg,
-            ast::FnArgumentType::Param(_) => StateSpace::Param,
-            ast::FnArgumentType::Shared => StateSpace::Shared,
+        let is_variable = match a.v_type {
+            ast::FnArgumentType::Reg(_) => true,
+            ast::FnArgumentType::Param(_) => false,
+            ast::FnArgumentType::Shared => false,
         };
         Ok(ast::FnArgument {
-            name: fn_resolver.add_def(a.name, Some((ss, var_type))),
+            name: fn_resolver.add_def(a.name, Some(var_type), is_variable),
             v_type: a.v_type.clone(),
             align: a.align,
             array_init: Vec::new(),
@@ -1277,9 +1275,9 @@ fn to_ssa<'input, 'b>(
     let unadorned_statements = normalize_predicates(normalized_ids, &mut numeric_id_defs);
     let typed_statements =
         convert_to_typed_statements(unadorned_statements, &fn_defs, &numeric_id_defs)?;
-    let mut numeric_id_defs = numeric_id_defs.finish();
     let ssa_statements =
         insert_mem_ssa_statements(typed_statements, &mut numeric_id_defs, &mut spirv_decl)?;
+    let mut numeric_id_defs = numeric_id_defs.finish();
     let expanded_statements = expand_arguments(ssa_statements, &mut numeric_id_defs)?;
     let expanded_statements =
         insert_implicit_conversions(expanded_statements, &mut numeric_id_defs)?;
@@ -1421,62 +1419,23 @@ fn convert_to_typed_statements(
                     };
                     result.push(Statement::Call(resolved_call));
                 }
-                // Supported ld/st:
-                // global: only compatible with reg b64/u64/s64 source/dest
-                // generic: compatible with global/local sources
-                // param: compiled as mov
-                // local compiled as mov
-                // We would like to convert ld/st local/param to movs here,
-                // but they have different semantics for implicit conversions
-                // For now, we convert generic ld from local params to ld.local.
-                // This way, we can rely on further stages of the compilation on
-                // ld.generic & ld.global having bytes address source
-                // One complication: immediate address is only allowed in local,
-                // It is not supported in generic ld
-                //     ld.local foo, [1];
-                ast::Instruction::Ld(mut d, arg) => {
-                    match arg.src.underlying() {
-                        None => {}
-                        Some(u) => {
-                            let (ss, _) = id_defs.get_typed(*u)?;
-                            match (d.state_space, ss) {
-                                (ast::LdStateSpace::Generic, StateSpace::Local) => {
-                                    d.state_space = ast::LdStateSpace::Local;
-                                }
-                                _ => {}
-                            };
-                        }
-                    };
+                ast::Instruction::Ld(d, arg) => {
                     result.push(Statement::Instruction(ast::Instruction::Ld(d, arg.cast())));
                 }
-                ast::Instruction::St(mut d, arg) => {
-                    match arg.src1.underlying() {
-                        None => {}
-                        Some(u) => {
-                            let (ss, _) = id_defs.get_typed(*u)?;
-                            match (d.state_space, ss) {
-                                (ast::StStateSpace::Generic, StateSpace::Local) => {
-                                    d.state_space = ast::StStateSpace::Local;
-                                }
-                                _ => (),
-                            };
-                        }
-                    };
+                ast::Instruction::St(d, arg) => {
                     result.push(Statement::Instruction(ast::Instruction::St(d, arg.cast())));
                 }
                 ast::Instruction::Mov(mut d, args) => match args {
                     ast::Arg2Mov::Normal(arg) => {
                         if let Some(src_id) = arg.src.single_underlying() {
-                            let (scope, _) = id_defs.get_typed(*src_id)?;
-                            d.src_is_address = match scope {
-                                StateSpace::Reg => false,
-                                StateSpace::Const
-                                | StateSpace::Global
-                                | StateSpace::Local
-                                | StateSpace::Shared
-                                | StateSpace::Param
-                                | StateSpace::ParamReg => true,
+                            let (typ, _) = id_defs.get_typed(*src_id)?;
+                            let take_address = match typ {
+                                ast::Type::Scalar(_) => false,
+                                ast::Type::Vector(_, _) => false,
+                                ast::Type::Array(_, _) => true,
+                                ast::Type::Pointer(_, _) => true,
                             };
+                            d.src_is_address = take_address;
                         }
                         result.push(Statement::Instruction(ast::Instruction::Mov(
                             d,
@@ -1486,7 +1445,7 @@ fn convert_to_typed_statements(
                     ast::Arg2Mov::Member(args) => {
                         if let Some(dst_typ) = args.vector_dst() {
                             match id_defs.get_typed(*dst_typ)? {
-                                (_, ast::Type::Vector(_, len)) => {
+                                (ast::Type::Vector(_, len), _) => {
                                     d.dst_width = len;
                                 }
                                 _ => return Err(TranslateError::MismatchedType),
@@ -1494,7 +1453,7 @@ fn convert_to_typed_statements(
                         };
                         if let Some((src_typ, _)) = args.vector_src() {
                             match id_defs.get_typed(*src_typ)? {
-                                (_, ast::Type::Vector(_, len)) => {
+                                (ast::Type::Vector(_, len), _) => {
                                     d.src_width = len;
                                 }
                                 _ => return Err(TranslateError::MismatchedType),
@@ -1689,14 +1648,14 @@ fn to_ptx_impl_atomic_call(
     };
     let fn_id = match ptx_impl_imports.entry(fn_name) {
         hash_map::Entry::Vacant(entry) => {
-            let fn_id = id_defs.new_id(None);
+            let fn_id = id_defs.new_non_variable(None);
             let func_decl = ast::MethodDecl::Func::<spirv::Word>(
                 vec![ast::FnArgument {
                     align: None,
                     v_type: ast::FnArgumentType::Reg(ast::VariableRegType::Scalar(
                         ast::ScalarType::U32,
                     )),
-                    name: id_defs.new_id(None),
+                    name: id_defs.new_non_variable(None),
                     array_init: Vec::new(),
                 }],
                 fn_id,
@@ -1707,7 +1666,7 @@ fn to_ptx_impl_atomic_call(
                             ast::SizedScalarType::U32,
                             ptr_space,
                         )),
-                        name: id_defs.new_id(None),
+                        name: id_defs.new_non_variable(None),
                         array_init: Vec::new(),
                     },
                     ast::FnArgument {
@@ -1715,7 +1674,7 @@ fn to_ptx_impl_atomic_call(
                         v_type: ast::FnArgumentType::Reg(ast::VariableRegType::Scalar(
                             ast::ScalarType::U32,
                         )),
-                        name: id_defs.new_id(None),
+                        name: id_defs.new_non_variable(None),
                         array_init: Vec::new(),
                     },
                 ],
@@ -1779,12 +1738,12 @@ fn to_ptx_impl_bfe_call(
     let fn_name = format!("{}{}", prefix, suffix);
     let fn_id = match ptx_impl_imports.entry(fn_name) {
         hash_map::Entry::Vacant(entry) => {
-            let fn_id = id_defs.new_id(None);
+            let fn_id = id_defs.new_non_variable(None);
             let func_decl = ast::MethodDecl::Func::<spirv::Word>(
                 vec![ast::FnArgument {
                     align: None,
                     v_type: ast::FnArgumentType::Reg(ast::VariableRegType::Scalar(typ.into())),
-                    name: id_defs.new_id(None),
+                    name: id_defs.new_non_variable(None),
                     array_init: Vec::new(),
                 }],
                 fn_id,
@@ -1792,7 +1751,7 @@ fn to_ptx_impl_bfe_call(
                     ast::FnArgument {
                         align: None,
                         v_type: ast::FnArgumentType::Reg(ast::VariableRegType::Scalar(typ.into())),
-                        name: id_defs.new_id(None),
+                        name: id_defs.new_non_variable(None),
                         array_init: Vec::new(),
                     },
                     ast::FnArgument {
@@ -1800,7 +1759,7 @@ fn to_ptx_impl_bfe_call(
                         v_type: ast::FnArgumentType::Reg(ast::VariableRegType::Scalar(
                             ast::ScalarType::U32,
                         )),
-                        name: id_defs.new_id(None),
+                        name: id_defs.new_non_variable(None),
                         array_init: Vec::new(),
                     },
                     ast::FnArgument {
@@ -1808,7 +1767,7 @@ fn to_ptx_impl_bfe_call(
                         v_type: ast::FnArgumentType::Reg(ast::VariableRegType::Scalar(
                             ast::ScalarType::U32,
                         )),
-                        name: id_defs.new_id(None),
+                        name: id_defs.new_non_variable(None),
                         array_init: Vec::new(),
                     },
                 ],
@@ -1896,7 +1855,7 @@ fn normalize_labels(
             | Statement::PtrAdd { .. } => {}
         }
     }
-    iter::once(Statement::Label(id_def.new_id(None)))
+    iter::once(Statement::Label(id_def.new_non_variable(None)))
         .chain(func.into_iter().filter(|s| match s {
             Statement::Label(i) => labels_in_use.contains(i),
             _ => true,
@@ -1914,8 +1873,8 @@ fn normalize_predicates(
             Statement::Label(id) => result.push(Statement::Label(id)),
             Statement::Instruction((pred, inst)) => {
                 if let Some(pred) = pred {
-                    let if_true = id_def.new_id(None);
-                    let if_false = id_def.new_id(None);
+                    let if_true = id_def.new_non_variable(None);
+                    let if_false = id_def.new_non_variable(None);
                     let folded_bra = match &inst {
                         ast::Instruction::Bra(_, arg) => Some(arg.src),
                         _ => None,
@@ -1948,7 +1907,7 @@ fn normalize_predicates(
 
 fn insert_mem_ssa_statements<'a, 'b>(
     func: Vec<TypedStatement>,
-    id_def: &mut MutableNumericIdResolver,
+    id_def: &mut NumericIdResolver,
     fn_decl: &mut SpirvMethodDecl,
 ) -> Result<Vec<TypedStatement>, TranslateError> {
     let mut result = Vec::with_capacity(func.len());
@@ -1969,7 +1928,7 @@ fn insert_mem_ssa_statements<'a, 'b>(
         match type_to_variable_type(&arg.v_type)? {
             Some(var_type) => {
                 let typ = arg.v_type.clone();
-                let new_id = id_def.new_id(typ.clone());
+                let new_id = id_def.new_non_variable(Some(typ.clone()));
                 result.push(Statement::Variable(ast::Variable {
                     align: arg.align,
                     v_type: var_type,
@@ -1997,8 +1956,8 @@ fn insert_mem_ssa_statements<'a, 'b>(
                 ast::Instruction::Ret(d) => {
                     // TODO: handle multiple output args
                     if let &[out_param] = &fn_decl.output.as_slice() {
-                        let typ = id_def.get_typed(out_param.name)?;
-                        let new_id = id_def.new_id(typ.clone());
+                        let (typ, _) = id_def.get_typed(out_param.name)?;
+                        let new_id = id_def.new_non_variable(Some(typ.clone()));
                         result.push(Statement::LoadVar(
                             ast::Arg2 {
                                 dst: new_id,
@@ -2014,7 +1973,8 @@ fn insert_mem_ssa_statements<'a, 'b>(
                 inst => insert_mem_ssa_statement_default(id_def, &mut result, inst)?,
             },
             Statement::Conditional(mut bra) => {
-                let generated_id = id_def.new_id(ast::Type::Scalar(ast::ScalarType::Pred));
+                let generated_id =
+                    id_def.new_non_variable(Some(ast::Type::Scalar(ast::ScalarType::Pred)));
                 result.push(Statement::LoadVar(
                     Arg2 {
                         dst: generated_id,
@@ -2105,34 +2065,32 @@ impl<'a, Ctor: FnOnce(spirv::Word) -> ExpandedStatement> VisitVariableExpanded
 }
 
 fn insert_mem_ssa_statement_default<'a, F: VisitVariable>(
-    id_def: &mut MutableNumericIdResolver,
+    id_def: &mut NumericIdResolver,
     result: &mut Vec<TypedStatement>,
     stmt: F,
 ) -> Result<(), TranslateError> {
     let mut post_statements = Vec::new();
-    let new_statement =
-        stmt.visit_variable(&mut |desc: ArgumentDescriptor<spirv::Word>, instr_type| {
-            if instr_type.is_none() || desc.sema == ArgumentSemantics::RegisterPointer {
+    let new_statement = stmt.visit_variable(
+        &mut |desc: ArgumentDescriptor<spirv::Word>, expected_type| {
+            if expected_type.is_none() {
                 return Ok(desc.op);
-            }
-            let id_type = match (id_def.get_typed(desc.op)?, desc.sema) {
-                (_, ArgumentSemantics::Address) => return Ok(desc.op),
-                (t, ArgumentSemantics::RegisterPointer)
-                | (t, ArgumentSemantics::Default)
-                | (t, ArgumentSemantics::DefaultRelaxed)
-                | (t, ArgumentSemantics::PhysicalPointer) => t,
             };
-            if let ast::Type::Array(_, _) = id_type {
+            let (var_type, is_variable) = id_def.get_typed(desc.op)?;
+            if !is_variable {
                 return Ok(desc.op);
             }
-            let generated_id = id_def.new_id(id_type.clone());
+            match var_type {
+                ast::Type::Array(..) => return Ok(desc.op),
+                _ => {}
+            }
+            let generated_id = id_def.new_non_variable(Some(var_type.clone()));
             if !desc.is_dst {
                 result.push(Statement::LoadVar(
                     Arg2 {
                         dst: generated_id,
                         src: desc.op,
                     },
-                    id_type,
+                    var_type,
                 ));
             } else {
                 post_statements.push(Statement::StoreVar(
@@ -2140,11 +2098,12 @@ fn insert_mem_ssa_statement_default<'a, F: VisitVariable>(
                         src1: desc.op,
                         src2: generated_id,
                     },
-                    id_type,
+                    var_type,
                 ));
             }
             Ok(generated_id)
-        })?;
+        },
+    )?;
     result.push(new_statement);
     result.append(&mut post_statements);
     Ok(())
@@ -2270,7 +2229,8 @@ impl<'a, 'b> FlattenArguments<'a, 'b> {
         scalar_sema_override: Option<ArgumentSemantics>,
         composite_src: (spirv::Word, u8),
     ) -> spirv::Word {
-        let new_id = scalar_dst.unwrap_or_else(|| id_def.new_id(ast::Type::Scalar(typ.0)));
+        let new_id =
+            scalar_dst.unwrap_or_else(|| id_def.new_non_variable(ast::Type::Scalar(typ.0)));
         func.push(Statement::Composite(CompositeRead {
             typ: typ.0,
             dst: new_id,
@@ -2301,13 +2261,13 @@ impl<'a, 'b> FlattenArguments<'a, 'b> {
             ast::Type::Pointer(underlying_type, state_space) => {
                 let reg_typ = self.id_def.get_typed(reg)?;
                 if let ast::Type::Pointer(_, _) = reg_typ {
-                    let id_constant_stmt = self.id_def.new_id(typ.clone());
+                    let id_constant_stmt = self.id_def.new_non_variable(typ.clone());
                     self.func.push(Statement::Constant(ConstantDefinition {
                         dst: id_constant_stmt,
                         typ: ast::ScalarType::S64,
                         value: ast::ImmediateValue::S64(offset as i64),
                     }));
-                    let dst = self.id_def.new_id(typ.clone());
+                    let dst = self.id_def.new_non_variable(typ.clone());
                     self.func.push(Statement::PtrAdd {
                         underlying_type: underlying_type.clone(),
                         state_space: *state_space,
@@ -2346,8 +2306,8 @@ impl<'a, 'b> FlattenArguments<'a, 'b> {
         } else {
             ast::ArithDetails::Unsigned(ast::UIntType::from_size(width))
         };
-        let id_constant_stmt = self.id_def.new_id(add_type.clone());
-        let result_id = self.id_def.new_id(add_type);
+        let id_constant_stmt = self.id_def.new_non_variable(add_type.clone());
+        let result_id = self.id_def.new_non_variable(add_type);
         // TODO: check for edge cases around min value/max value/wrapping
         if offset < 0 && kind != ScalarKind::Signed {
             self.func.push(Statement::Constant(ConstantDefinition {
@@ -2395,7 +2355,7 @@ impl<'a, 'b> FlattenArguments<'a, 'b> {
         } else {
             todo!()
         };
-        let id = self.id_def.new_id(ast::Type::Scalar(scalar_t));
+        let id = self.id_def.new_non_variable(ast::Type::Scalar(scalar_t));
         self.func.push(Statement::Constant(ConstantDefinition {
             dst: id,
             typ: scalar_t,
@@ -2430,10 +2390,10 @@ impl<'a, 'b> FlattenArguments<'a, 'b> {
     ) -> Result<spirv::Word, TranslateError> {
         let (scalar_type, vec_len) = typ.get_vector()?;
         if !desc.is_dst {
-            let mut new_id = self.id_def.new_id(typ.clone());
+            let mut new_id = self.id_def.new_non_variable(typ.clone());
             self.func.push(Statement::Undef(typ.clone(), new_id));
             for (idx, id) in desc.op.iter().enumerate() {
-                let newer_id = self.id_def.new_id(typ.clone());
+                let newer_id = self.id_def.new_non_variable(typ.clone());
                 self.func.push(Statement::Instruction(ast::Instruction::Mov(
                     ast::MovDetails {
                         typ: ast::Type::Scalar(scalar_type),
@@ -2452,7 +2412,7 @@ impl<'a, 'b> FlattenArguments<'a, 'b> {
             }
             Ok(new_id)
         } else {
-            let new_id = self.id_def.new_id(typ.clone());
+            let new_id = self.id_def.new_non_variable(typ.clone());
             for (idx, id) in desc.op.iter().enumerate() {
                 Self::insert_composite_read(
                     &mut self.post_stmts,
@@ -2688,7 +2648,7 @@ fn insert_implicit_conversions_impl(
                 };
                 let mut from = instr_type.clone();
                 let mut to = operand_type;
-                let mut src = id_def.new_id(instr_type.clone());
+                let mut src = id_def.new_non_variable(instr_type.clone());
                 let mut dst = desc.op;
                 let result = Ok(src);
                 if !desc.is_dst {
@@ -4156,7 +4116,7 @@ fn normalize_identifiers<'a, 'b>(
     for s in func.iter() {
         match s {
             ast::Statement::Label(id) => {
-                id_defs.add_def(*id, None);
+                id_defs.add_def(*id, None, false);
             }
             _ => (),
         }
@@ -4189,23 +4149,20 @@ fn expand_map_variables<'a, 'b>(
             i.map_variable(&mut |id| id_defs.get_id(id))?,
         ))),
         ast::Statement::Variable(var) => {
-            let ss = match var.var.v_type {
-                ast::VariableType::Reg(_) => StateSpace::Reg,
-                ast::VariableType::Global(_) => StateSpace::Global,
-                ast::VariableType::Shared(_) => StateSpace::Shared,
-                ast::VariableType::Param(_) => StateSpace::ParamReg,
-                ast::VariableType::Local(_) => StateSpace::Local,
-            };
             let mut var_type = ast::Type::from(var.var.v_type.clone());
+            let mut is_variable = false;
             var_type = match var.var.v_type {
-                ast::VariableType::Reg(_) | ast::VariableType::Shared(_) => var_type,
+                ast::VariableType::Reg(_) | ast::VariableType::Shared(_) => {
+                    is_variable = true;
+                    var_type
+                }
                 ast::VariableType::Global(_) => var_type.pointer_to(ast::LdStateSpace::Global)?,
                 ast::VariableType::Param(_) => var_type.pointer_to(ast::LdStateSpace::Param)?,
                 ast::VariableType::Local(_) => var_type.pointer_to(ast::LdStateSpace::Local)?,
             };
             match var.count {
                 Some(count) => {
-                    for new_id in id_defs.add_defs(var.var.name, count, ss, var_type) {
+                    for new_id in id_defs.add_defs(var.var.name, count, var_type, is_variable) {
                         result.push(Statement::Variable(ast::Variable {
                             align: var.var.align,
                             v_type: var.var.v_type.clone(),
@@ -4215,7 +4172,7 @@ fn expand_map_variables<'a, 'b>(
                     }
                 }
                 None => {
-                    let new_id = id_defs.add_def(var.var.name, Some((ss, var_type)));
+                    let new_id = id_defs.add_def(var.var.name, Some(var_type), is_variable);
                     result.push(Statement::Variable(ast::Variable {
                         align: var.var.align,
                         v_type: var.var.v_type.clone(),
@@ -4270,7 +4227,7 @@ impl PtxSpecialRegister {
 struct GlobalStringIdResolver<'input> {
     current_id: spirv::Word,
     variables: HashMap<Cow<'input, str>, spirv::Word>,
-    variables_type_check: HashMap<u32, Option<(StateSpace, ast::Type)>>,
+    variables_type_check: HashMap<u32, Option<ast::Type>>,
     special_registers: HashMap<PtxSpecialRegister, spirv::Word>,
     fns: HashMap<spirv::Word, FnDecl>,
 }
@@ -4295,15 +4252,11 @@ impl<'a> GlobalStringIdResolver<'a> {
         self.get_or_add_impl(id, None)
     }
 
-    fn get_or_add_def_typed(&mut self, id: &'a str, typ: (StateSpace, ast::Type)) -> spirv::Word {
+    fn get_or_add_def_typed(&mut self, id: &'a str, typ: ast::Type) -> spirv::Word {
         self.get_or_add_impl(id, Some(typ))
     }
 
-    fn get_or_add_impl(
-        &mut self,
-        id: &'a str,
-        typ: Option<(StateSpace, ast::Type)>,
-    ) -> spirv::Word {
+    fn get_or_add_impl(&mut self, id: &'a str, typ: Option<ast::Type>) -> spirv::Word {
         let id = match self.variables.entry(Cow::Borrowed(id)) {
             hash_map::Entry::Occupied(e) => *(e.get()),
             hash_map::Entry::Vacant(e) => {
@@ -4399,10 +4352,10 @@ impl<'input, 'a> GlobalFnDeclResolver<'input, 'a> {
 struct FnStringIdResolver<'input, 'b> {
     current_id: &'b mut spirv::Word,
     global_variables: &'b HashMap<Cow<'input, str>, spirv::Word>,
-    global_type_check: &'b HashMap<u32, Option<(StateSpace, ast::Type)>>,
+    global_type_check: &'b HashMap<u32, Option<ast::Type>>,
     special_registers: &'b mut HashMap<PtxSpecialRegister, spirv::Word>,
     variables: Vec<HashMap<Cow<'input, str>, spirv::Word>>,
-    type_check: HashMap<u32, Option<(StateSpace, ast::Type)>>,
+    type_check: HashMap<u32, Option<(ast::Type, bool)>>,
 }
 
 impl<'a, 'b> FnStringIdResolver<'a, 'b> {
@@ -4452,13 +4405,14 @@ impl<'a, 'b> FnStringIdResolver<'a, 'b> {
         }
     }
 
-    fn add_def(&mut self, id: &'a str, typ: Option<(StateSpace, ast::Type)>) -> spirv::Word {
+    fn add_def(&mut self, id: &'a str, typ: Option<ast::Type>, is_variable: bool) -> spirv::Word {
         let numeric_id = *self.current_id;
         self.variables
             .last_mut()
             .unwrap()
             .insert(Cow::Borrowed(id), numeric_id);
-        self.type_check.insert(numeric_id, typ);
+        self.type_check
+            .insert(numeric_id, typ.map(|t| (t, is_variable)));
         *self.current_id += 1;
         numeric_id
     }
@@ -4468,8 +4422,8 @@ impl<'a, 'b> FnStringIdResolver<'a, 'b> {
         &mut self,
         base_id: &'a str,
         count: u32,
-        ss: StateSpace,
         typ: ast::Type,
+        is_variable: bool,
     ) -> impl Iterator<Item = spirv::Word> {
         let numeric_id = *self.current_id;
         for i in 0..count {
@@ -4478,7 +4432,7 @@ impl<'a, 'b> FnStringIdResolver<'a, 'b> {
                 .unwrap()
                 .insert(Cow::Owned(format!("{}{}", base_id, i)), numeric_id + i);
             self.type_check
-                .insert(numeric_id + i, Some((ss, typ.clone())));
+                .insert(numeric_id + i, Some((typ.clone(), is_variable)));
         }
         *self.current_id += count;
         (0..count).into_iter().map(move |i| i + numeric_id)
@@ -4487,8 +4441,8 @@ impl<'a, 'b> FnStringIdResolver<'a, 'b> {
 
 struct NumericIdResolver<'b> {
     current_id: &'b mut spirv::Word,
-    global_type_check: &'b HashMap<u32, Option<(StateSpace, ast::Type)>>,
-    type_check: HashMap<u32, Option<(StateSpace, ast::Type)>>,
+    global_type_check: &'b HashMap<u32, Option<ast::Type>>,
+    type_check: HashMap<u32, Option<(ast::Type, bool)>>,
     special_registers: HashMap<spirv::Word, PtxSpecialRegister>,
 }
 
@@ -4497,23 +4451,32 @@ impl<'b> NumericIdResolver<'b> {
         MutableNumericIdResolver { base: self }
     }
 
-    fn get_typed(&self, id: spirv::Word) -> Result<(StateSpace, ast::Type), TranslateError> {
+    fn get_typed(&self, id: spirv::Word) -> Result<(ast::Type, bool), TranslateError> {
         match self.type_check.get(&id) {
             Some(Some(x)) => Ok(x.clone()),
             Some(None) => Err(TranslateError::UntypedSymbol),
             None => match self.special_registers.get(&id) {
-                Some(x) => Ok((StateSpace::Reg, x.get_type())),
+                Some(x) => Ok((x.get_type(), true)),
                 None => match self.global_type_check.get(&id) {
-                    Some(Some(x)) => Ok(x.clone()),
+                    Some(Some(x)) => Ok((x.clone(), true)),
                     Some(None) | None => Err(TranslateError::UntypedSymbol),
                 },
             },
         }
     }
 
-    fn new_id(&mut self, typ: Option<(StateSpace, ast::Type)>) -> spirv::Word {
+    // This is for identifiers which will be emitted later as OpVariable
+    // They are candidates for insertion of LoadVar/StoreVar
+    fn new_variable(&mut self, typ: ast::Type) -> spirv::Word {
         let new_id = *self.current_id;
-        self.type_check.insert(new_id, typ);
+        self.type_check.insert(new_id, Some((typ, true)));
+        *self.current_id += 1;
+        new_id
+    }
+
+    fn new_non_variable(&mut self, typ: Option<ast::Type>) -> spirv::Word {
+        let new_id = *self.current_id;
+        self.type_check.insert(new_id, typ.map(|t| (t, false)));
         *self.current_id += 1;
         new_id
     }
@@ -4529,11 +4492,11 @@ impl<'b> MutableNumericIdResolver<'b> {
     }
 
     fn get_typed(&self, id: spirv::Word) -> Result<ast::Type, TranslateError> {
-        self.base.get_typed(id).map(|(_, t)| t)
+        self.base.get_typed(id).map(|(t, _)| t)
     }
 
-    fn new_id(&mut self, typ: ast::Type) -> spirv::Word {
-        self.base.new_id(Some((StateSpace::Reg, typ)))
+    fn new_non_variable(&mut self, typ: ast::Type) -> spirv::Word {
+        self.base.new_non_variable(Some(typ))
     }
 }
 
