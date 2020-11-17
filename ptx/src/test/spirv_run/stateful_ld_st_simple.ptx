@@ -2,7 +2,7 @@
 .target sm_30
 .address_size 64
 
-.visible .entry ld_st_stateful(
+.visible .entry stateful_ld_st_simple(
     .param .u64 input,
     .param .u64 output
 )
