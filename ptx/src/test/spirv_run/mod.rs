@@ -133,7 +133,7 @@ test_ptx!(
     [0b11111000_11000001_00100010_10100000u32, 16u32, 8u32],
     [0b11000001u32]
 );
-test_ptx!(ld_st_stateful, [1u64], [1u64]);
+test_ptx!(stateful_ld_st_simple, [121u64], [121u64]);
 
 struct DisplayError<T: Debug> {
     err: T,
