@@ -1206,7 +1206,7 @@ fn translate_variable<'a>(
             // If it's a pointer it will be translated to a method parameter later
             if let ast::Type::Pointer(..) = var_type {
                 is_variable = true;
-                var_type.param_pointer_to(ast::LdStateSpace::Param)?
+                var_type
             } else {
                 var_type.param_pointer_to(ast::LdStateSpace::Shared)?
             }
@@ -4160,7 +4160,7 @@ fn expand_map_variables<'a, 'b>(
                     // If it's a pointer it will be translated to a method parameter later
                     if let ast::Type::Pointer(..) = var_type {
                         is_variable = true;
-                        var_type.param_pointer_to(ast::LdStateSpace::Param)?
+                        var_type
                     } else {
                         var_type.param_pointer_to(ast::LdStateSpace::Shared)?
                     }
