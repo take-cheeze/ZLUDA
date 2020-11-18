@@ -38,27 +38,27 @@
          %16 = OpBitcast %_ptr_Function_ulong %3
          %15 = OpLoad %ulong %16
          %26 = OpConvertUToPtr %_ptr_CrossWorkgroup_uchar %15
-               OpStore %11 %26
+               OpStore %10 %26
          %27 = OpLoad %_ptr_CrossWorkgroup_uchar %9
          %18 = OpConvertPtrToU %ulong %27
          %36 = OpCopyObject %ulong %18
          %35 = OpCopyObject %ulong %36
          %17 = OpCopyObject %ulong %35
          %28 = OpConvertUToPtr %_ptr_CrossWorkgroup_uchar %17
-               OpStore %12 %28
-         %29 = OpLoad %_ptr_CrossWorkgroup_uchar %11
+               OpStore %11 %28
+         %29 = OpLoad %_ptr_CrossWorkgroup_uchar %10
          %20 = OpConvertPtrToU %ulong %29
          %38 = OpCopyObject %ulong %20
          %37 = OpCopyObject %ulong %38
          %19 = OpCopyObject %ulong %37
          %30 = OpConvertUToPtr %_ptr_CrossWorkgroup_uchar %19
-               OpStore %10 %30
-         %31 = OpLoad %_ptr_CrossWorkgroup_uchar %12
+               OpStore %12 %30
+         %31 = OpLoad %_ptr_CrossWorkgroup_uchar %11
          %21 = OpConvertPtrToU %ulong %31
          %39 = OpConvertUToPtr %_ptr_CrossWorkgroup_ulong %21
          %32 = OpLoad %ulong %39
                OpStore %8 %32
-         %33 = OpLoad %_ptr_CrossWorkgroup_uchar %10
+         %33 = OpLoad %_ptr_CrossWorkgroup_uchar %12
          %22 = OpConvertPtrToU %ulong %33
          %34 = OpLoad %ulong %8
          %40 = OpConvertUToPtr %_ptr_CrossWorkgroup_ulong %22

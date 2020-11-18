@@ -1,7 +1,7 @@
 use crate::ast;
 use half::f16;
 use rspirv::dr;
-use std::{borrow::Cow, ffi::CString, hash::Hash, iter, mem};
+use std::{collections::BTreeSet, borrow::Cow, ffi::CString, hash::Hash, iter, mem};
 use std::{
     collections::{hash_map, HashMap, HashSet},
     convert::TryInto,
@@ -4273,7 +4273,9 @@ fn convert_to_stateful_memory_access<'a>(
         }
     }
     let mut func_args_ptr = HashSet::new();
-    let mut regs_ptr_current = HashSet::new();
+    // BTreeSet here to have a stable order of iteration,
+    // unfortunately our tests rely on it
+    let mut regs_ptr_current = BTreeSet::new();
     for (dst, src) in stateful_markers {
         if let Some(func_args) = stateful_init_reg.get(&src) {
             for a in func_args {
