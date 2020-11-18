@@ -971,7 +971,7 @@ fn compute_denorm_information<'input>(
                         Statement::Undef(_, _) => {}
                         Statement::Label(_) => {}
                         Statement::Variable(_) => {}
-                        Statement::PtrAdd { .. } => {}
+                        Statement::PtrAccess { .. } => {}
                     }
                 }
                 denorm_methods.insert(method_key, flush_counter);
@@ -1635,6 +1635,7 @@ fn convert_to_typed_statements(
             },
             Statement::Label(i) => result.push(Statement::Label(i)),
             Statement::Variable(v) => result.push(Statement::Variable(v)),
+            Statement::Conditional(c) => result.push(Statement::Conditional(c)),
             _ => return Err(TranslateError::Unreachable),
         }
     }
@@ -1868,7 +1869,7 @@ fn normalize_labels(
             | Statement::Constant(_)
             | Statement::Label(_)
             | Statement::Undef(_, _)
-            | Statement::PtrAdd { .. } => {}
+            | Statement::PtrAccess { .. } => {}
         }
     }
     iter::once(Statement::Label(id_def.new_non_variable(None)))
@@ -2003,6 +2004,9 @@ fn insert_mem_ssa_statements<'a, 'b>(
             }
             Statement::Conversion(conv) => {
                 insert_mem_ssa_statement_default(id_def, &mut result, conv)?
+            }
+            Statement::PtrAccess(ptr_access) => {
+                insert_mem_ssa_statement_default(id_def, &mut result, ptr_access)?
             }
             s @ Statement::Variable(_) | s @ Statement::Label(_) => result.push(s),
             _ => return Err(TranslateError::Unreachable),
@@ -2159,55 +2163,11 @@ fn expand_arguments<'a, 'b>(
                 name,
                 array_init,
             })),
-            Statement::PtrAdd {
-                underlying_type,
-                state_space,
-                dst,
-                ptr_src,
-                offset_src: constant_src,
-            } => {
+            Statement::PtrAccess(ptr_access) => {
                 let mut visitor = FlattenArguments::new(&mut result, id_def);
-                let sema = match state_space {
-                    ast::LdStateSpace::Const
-                    | ast::LdStateSpace::Global
-                    | ast::LdStateSpace::Shared
-                    | ast::LdStateSpace::Generic => ArgumentSemantics::PhysicalPointer,
-                    ast::LdStateSpace::Local | ast::LdStateSpace::Param => {
-                        ArgumentSemantics::RegisterPointer
-                    }
-                };
-                let ptr_type = ast::Type::Pointer(underlying_type.clone(), state_space);
-                let new_dst = visitor.id(
-                    ArgumentDescriptor {
-                        op: dst,
-                        is_dst: true,
-                        sema,
-                    },
-                    Some(&ptr_type),
-                )?;
-                let new_ptr_src = visitor.id(
-                    ArgumentDescriptor {
-                        op: ptr_src,
-                        is_dst: false,
-                        sema,
-                    },
-                    Some(&ptr_type),
-                )?;
-                let new_constant_src = visitor.id(
-                    ArgumentDescriptor {
-                        op: constant_src,
-                        is_dst: false,
-                        sema: ArgumentSemantics::Default,
-                    },
-                    Some(&ast::Type::Scalar(ast::ScalarType::S64)),
-                )?;
-                result.push(Statement::PtrAdd {
-                    underlying_type,
-                    state_space,
-                    dst: new_dst,
-                    ptr_src: new_ptr_src,
-                    offset_src: new_constant_src,
-                })
+                let (new_inst, post_stmts) = (ptr_access.map(&mut visitor)?, visitor.post_stmts);
+                result.push(Statement::PtrAccess(new_inst));
+                result.extend(post_stmts);
             }
             Statement::Label(id) => result.push(Statement::Label(id)),
             Statement::Conditional(bra) => result.push(Statement::Conditional(bra)),
@@ -2288,13 +2248,13 @@ impl<'a, 'b> FlattenArguments<'a, 'b> {
                         value: ast::ImmediateValue::S64(offset as i64),
                     }));
                     let dst = self.id_def.new_non_variable(typ.clone());
-                    self.func.push(Statement::PtrAdd {
+                    self.func.push(Statement::PtrAccess(PtrAccess {
                         underlying_type: underlying_type.clone(),
                         state_space: *state_space,
                         dst,
                         ptr_src: reg,
                         offset_src: id_constant_stmt,
-                    });
+                    }));
                     return Ok(dst);
                 } else {
                     add_type = self.id_def.get_typed(reg)?;
@@ -2577,13 +2537,13 @@ fn insert_implicit_conversions(
                 should_bitcast_wrapper,
                 None,
             )?,
-            Statement::PtrAdd {
+            Statement::PtrAccess(PtrAccess {
                 underlying_type,
                 state_space,
                 dst,
                 ptr_src,
                 offset_src: constant_src,
-            } => {
+            }) => {
                 let visit_desc = VisitArgumentDescriptor {
                     desc: ArgumentDescriptor {
                         op: ptr_src,
@@ -2591,12 +2551,14 @@ fn insert_implicit_conversions(
                         sema: ArgumentSemantics::PhysicalPointer,
                     },
                     typ: &ast::Type::Pointer(underlying_type.clone(), state_space),
-                    stmt_ctor: |new_ptr_src| Statement::PtrAdd {
-                        underlying_type,
-                        state_space,
-                        dst,
-                        ptr_src: new_ptr_src,
-                        offset_src: constant_src,
+                    stmt_ctor: |new_ptr_src| {
+                        Statement::PtrAccess(PtrAccess {
+                            underlying_type,
+                            state_space,
+                            dst,
+                            ptr_src: new_ptr_src,
+                            offset_src: constant_src,
+                        })
                     },
                 };
                 insert_implicit_conversions_impl(
@@ -3224,13 +3186,13 @@ fn emit_function_body_ops(
                 let result_type = map.get_or_add(builder, SpirvType::from(t.clone()));
                 builder.undef(result_type, Some(*id));
             }
-            Statement::PtrAdd {
+            Statement::PtrAccess(PtrAccess {
                 underlying_type,
                 state_space,
                 dst,
                 ptr_src,
                 offset_src,
-            } => {
+            }) => {
                 let u8_pointer = map.get_or_add(
                     builder,
                     SpirvType::from(ast::Type::Pointer(
@@ -4243,6 +4205,7 @@ fn expand_map_variables<'a, 'b>(
 // TODO: don't convert to ptr if the register is not ultimately used for ld/st
 // TODO: once insert_mem_ssa_statements is moved to later, move this pass after
 //       argument expansion
+// TODO: propagate through calls?
 fn convert_to_stateful_memory_access<'a>(
     func_args: &mut SpirvMethodDecl,
     func_body: Vec<TypedStatement>,
@@ -4397,183 +4360,70 @@ fn convert_to_stateful_memory_access<'a>(
                     result.push(Statement::Variable(var));
                 }
             }
-            Statement::Instruction(ast::Instruction::Cvta(
-                ast::CvtaDetails {
-                    to: ast::CvtaStateSpace::Global,
-                    size: ast::CvtaSize::U64,
-                    from: ast::CvtaStateSpace::Generic,
-                },
+            Statement::Instruction(ast::Instruction::Add(
+                ast::ArithDetails::Unsigned(ast::UIntType::U64),
                 arg,
-            )) if is_cvta_ptr_direct(&remapped_ids, &arg) => {
-                let new_dst = *remapped_ids.get(&arg.dst).unwrap();
-                let new_src = *remapped_ids.get(&arg.src.underlying().unwrap()).unwrap();
-                result.push(Statement::Instruction(ast::Instruction::Mov(
-                    ast::MovDetails {
-                        typ: ast::Type::Pointer(
-                            ast::PointerType::Scalar(ast::ScalarType::U8),
-                            ast::LdStateSpace::Global,
-                        ),
-                        src_is_address: false,
-                        dst_width: 0,
-                        src_width: 0,
-                        relaxed_src2_conv: false,
-                    },
-                    ast::Arg2Mov::Normal(ast::Arg2MovNormal {
-                        dst: ast::IdOrVector::Reg(new_dst),
-                        src: ast::OperandOrVector::Reg(new_src),
-                    }),
-                )));
-            }
-            Statement::Instruction(ast::Instruction::Ld(
-                details
-                @
-                ast::LdDetails {
-                    state_space: ast::LdStateSpace::Param,
-                    ..
-                },
+            ))
+            | Statement::Instruction(ast::Instruction::Add(
+                ast::ArithDetails::Signed(ast::ArithSInt {
+                    typ: ast::SIntType::S64,
+                    saturate: false,
+                }),
                 arg,
-            )) if is_param_ld_ptr_direct(&remapped_ids, &func_args_ptr, &arg) => {
-                let new_dst = if let ast::IdOrVector::Reg(dst) = arg.dst {
-                    *remapped_ids.get(&dst).unwrap()
-                } else {
-                    return Err(TranslateError::Unreachable);
+            )) if is_add_ptr_direct(&remapped_ids, &arg) => {
+                let (ptr, offset) = match arg.src1.underlying() {
+                    Some(src1) if remapped_ids.contains_key(src1) => {
+                        (remapped_ids.get(src1).unwrap(), arg.src2)
+                    }
+                    Some(src2) if remapped_ids.contains_key(src2) => {
+                        (remapped_ids.get(src2).unwrap(), arg.src1)
+                    }
+                    _ => return Err(TranslateError::Unreachable),
                 };
-                result.push(Statement::Instruction(ast::Instruction::Ld(
-                    ast::LdDetails {
-                        typ: ast::LdStType::Pointer(
-                            ast::PointerType::Scalar(ast::ScalarType::U8),
-                            ast::LdStateSpace::Global,
-                        ),
-                        ..details
-                    },
-                    ast::Arg2Ld {
-                        src: arg.src,
-                        dst: ast::IdOrVector::Reg(new_dst),
-                    },
-                )));
-            }
-            Statement::Instruction(ast::Instruction::Ld(
-                details
-                @
-                ast::LdDetails {
+                result.push(Statement::PtrAccess(PtrAccess {
+                    underlying_type: ast::PointerType::Scalar(ast::ScalarType::U8),
                     state_space: ast::LdStateSpace::Global,
-                    ..
-                },
-                arg,
-            )) if is_ldst_global_ptr_direct(&remapped_ids, &arg.src) => {
-                let new_src = if let ast::Operand::Reg(src) = arg.src {
-                    *remapped_ids.get(&src).unwrap()
-                } else {
-                    return Err(TranslateError::Unreachable);
-                };
-                result.push(Statement::Instruction(ast::Instruction::Ld(
-                    details,
-                    ast::Arg2Ld {
-                        src: ast::Operand::Reg(new_src),
-                        ..arg
-                    },
-                )));
-            }
-            Statement::Instruction(ast::Instruction::St(
-                details
-                @
-                ast::StData {
-                    state_space: ast::StStateSpace::Global,
-                    ..
-                },
-                arg,
-            )) if is_ldst_global_ptr_direct(&remapped_ids, &arg.src1) => {
-                let new_src1 = if let ast::Operand::Reg(src1) = arg.src1 {
-                    *remapped_ids.get(&src1).unwrap()
-                } else {
-                    return Err(TranslateError::Unreachable);
-                };
-                result.push(Statement::Instruction(ast::Instruction::St(
-                    details,
-                    ast::Arg2St {
-                        src1: ast::Operand::Reg(new_src1),
-                        ..arg
-                    },
-                )));
+                    dst: *remapped_ids.get(&arg.dst).unwrap(),
+                    ptr_src: *ptr,
+                    offset_src: offset,
+                }))
             }
             Statement::Instruction(inst) => {
                 let mut post_statements = Vec::new();
                 let new_statement =
-                    inst.visit_variable(&mut |arg_desc: ArgumentDescriptor<spirv::Word>, typ| {
-                        Ok(match remapped_ids.get(&arg_desc.op) {
-                            Some(new_id) => {
-                                let (old_type_full, _) = id_defs.get_typed(arg_desc.op)?;
-                                let old_type = old_type_full.clone();
-                                let converting_id = id_defs.new_non_variable(Some(old_type_full));
-                                if arg_desc.is_dst {
-                                    post_statements.push(Statement::Conversion(
-                                        ImplicitConversion {
-                                            src: converting_id,
-                                            dst: *new_id,
-                                            from: old_type,
-                                            to: ast::Type::Pointer(
-                                                ast::PointerType::Scalar(ast::ScalarType::U8),
-                                                ast::LdStateSpace::Global,
-                                            ),
-                                            kind: ConversionKind::BitToPtr(
-                                                ast::LdStateSpace::Global,
-                                            ),
-                                            src_sema: ArgumentSemantics::Default,
-                                            dst_sema: arg_desc.sema,
-                                        },
-                                    ));
-                                    converting_id
-                                } else {
-                                    result.push(Statement::Conversion(ImplicitConversion {
-                                        src: *new_id,
-                                        dst: converting_id,
-                                        from: ast::Type::Pointer(
-                                            ast::PointerType::Scalar(ast::ScalarType::U8),
-                                            ast::LdStateSpace::Global,
-                                        ),
-                                        to: old_type,
-                                        kind: ConversionKind::PtrToBit(ast::UIntType::U64),
-                                        src_sema: arg_desc.sema,
-                                        dst_sema: ArgumentSemantics::Default,
-                                    }));
-                                    converting_id
-                                }
-                            }
-                            None => match func_args_ptr.get(&arg_desc.op) {
-                                Some(new_id) => {
-                                    if arg_desc.is_dst {
-                                        return Err(TranslateError::Unreachable);
-                                    }
-                                    let (old_type, _) = id_defs.get_typed(arg_desc.op)?;
-                                    let old_type_clone = old_type.clone();
-                                    let converting_id = id_defs.new_non_variable(Some(old_type));
-                                    result.push(Statement::Conversion(ImplicitConversion {
-                                        src: *new_id,
-                                        dst: converting_id,
-                                        from: ast::Type::Pointer(
-                                            ast::PointerType::Pointer(
-                                                ast::ScalarType::U8,
-                                                ast::LdStateSpace::Global,
-                                            ),
-                                            ast::LdStateSpace::Param,
-                                        ),
-                                        to: old_type_clone,
-                                        kind: ConversionKind::PtrToPtr { spirv_ptr: false },
-                                        src_sema: arg_desc.sema,
-                                        dst_sema: ArgumentSemantics::Default,
-                                    }));
-                                    converting_id
-                                }
-                                None => arg_desc.op,
-                            },
-                        })
+                    inst.visit_variable(&mut |arg_desc: ArgumentDescriptor<spirv::Word>, _| {
+                        convert_to_stateful_memory_access_postprocess(
+                            id_defs,
+                            &remapped_ids,
+                            &func_args_ptr,
+                            &mut result,
+                            &mut post_statements,
+                            arg_desc,
+                        )
                     })?;
                 result.push(new_statement);
                 for s in post_statements {
                     result.push(s);
                 }
             }
-            Statement::Call(call) => todo!(),
+            Statement::Call(call) => {
+                let mut post_statements = Vec::new();
+                let new_statement =
+                    call.visit_variable(&mut |arg_desc: ArgumentDescriptor<spirv::Word>, _| {
+                        convert_to_stateful_memory_access_postprocess(
+                            id_defs,
+                            &remapped_ids,
+                            &func_args_ptr,
+                            &mut result,
+                            &mut post_statements,
+                            arg_desc,
+                        )
+                    })?;
+                result.push(new_statement);
+                for s in post_statements {
+                    result.push(s);
+                }
+            }
             _ => return Err(TranslateError::Unreachable),
         }
     }
@@ -4588,33 +4438,84 @@ fn convert_to_stateful_memory_access<'a>(
     Ok(result)
 }
 
-fn is_param_ld_ptr_direct(
-    remapped_ids: &HashMap<u32, u32>,
-    func_args_ptr: &HashSet<u32>,
-    arg: &ast::Arg2Ld<TypedArgParams>,
-) -> bool {
-    match (arg.src.underlying(), &arg.dst) {
-        (Some(src), ast::IdOrVector::Reg(dst)) => {
-            func_args_ptr.contains(src) && remapped_ids.contains_key(dst)
+fn convert_to_stateful_memory_access_postprocess(
+    id_defs: &mut NumericIdResolver,
+    remapped_ids: &HashMap<spirv::Word, spirv::Word>,
+    func_args_ptr: &HashSet<spirv::Word>,
+    result: &mut Vec<TypedStatement>,
+    post_statements: &mut Vec<TypedStatement>,
+    arg_desc: ArgumentDescriptor<spirv::Word>,
+) -> Result<spirv::Word, TranslateError> {
+    Ok(match remapped_ids.get(&arg_desc.op) {
+        Some(new_id) => {
+            let (old_type_full, _) = id_defs.get_typed(arg_desc.op)?;
+            let old_type = old_type_full.clone();
+            let converting_id = id_defs.new_non_variable(Some(old_type_full));
+            if arg_desc.is_dst {
+                post_statements.push(Statement::Conversion(ImplicitConversion {
+                    src: converting_id,
+                    dst: *new_id,
+                    from: old_type,
+                    to: ast::Type::Pointer(
+                        ast::PointerType::Scalar(ast::ScalarType::U8),
+                        ast::LdStateSpace::Global,
+                    ),
+                    kind: ConversionKind::BitToPtr(ast::LdStateSpace::Global),
+                    src_sema: ArgumentSemantics::Default,
+                    dst_sema: arg_desc.sema,
+                }));
+                converting_id
+            } else {
+                result.push(Statement::Conversion(ImplicitConversion {
+                    src: *new_id,
+                    dst: converting_id,
+                    from: ast::Type::Pointer(
+                        ast::PointerType::Scalar(ast::ScalarType::U8),
+                        ast::LdStateSpace::Global,
+                    ),
+                    to: old_type,
+                    kind: ConversionKind::PtrToBit(ast::UIntType::U64),
+                    src_sema: arg_desc.sema,
+                    dst_sema: ArgumentSemantics::Default,
+                }));
+                converting_id
+            }
         }
+        None => match func_args_ptr.get(&arg_desc.op) {
+            Some(new_id) => {
+                if arg_desc.is_dst {
+                    return Err(TranslateError::Unreachable);
+                }
+                let (old_type, _) = id_defs.get_typed(arg_desc.op)?;
+                let old_type_clone = old_type.clone();
+                let converting_id = id_defs.new_non_variable(Some(old_type));
+                result.push(Statement::Conversion(ImplicitConversion {
+                    src: *new_id,
+                    dst: converting_id,
+                    from: ast::Type::Pointer(
+                        ast::PointerType::Pointer(ast::ScalarType::U8, ast::LdStateSpace::Global),
+                        ast::LdStateSpace::Param,
+                    ),
+                    to: old_type_clone,
+                    kind: ConversionKind::PtrToPtr { spirv_ptr: false },
+                    src_sema: arg_desc.sema,
+                    dst_sema: ArgumentSemantics::Default,
+                }));
+                converting_id
+            }
+            None => arg_desc.op,
+        },
+    })
+}
+
+fn is_add_ptr_direct(remapped_ids: &HashMap<u32, u32>, arg: &ast::Arg3<TypedArgParams>) -> bool {
+    if !remapped_ids.contains_key(&arg.dst) {
+        return false;
+    }
+    match arg.src1.underlying() {
+        Some(src1) if remapped_ids.contains_key(src1) => true,
+        Some(src2) if remapped_ids.contains_key(src2) => true,
         _ => false,
-    }
-}
-
-fn is_cvta_ptr_direct(remapped_ids: &HashMap<u32, u32>, arg: &ast::Arg2<TypedArgParams>) -> bool {
-    match arg.src.underlying() {
-        Some(src) => remapped_ids.contains_key(src) && remapped_ids.contains_key(&arg.dst),
-        None => false,
-    }
-}
-
-fn is_ldst_global_ptr_direct(
-    remapped_ids: &HashMap<u32, u32>,
-    src: &ast::Operand<spirv::Word>,
-) -> bool {
-    match src.underlying() {
-        Some(src) => remapped_ids.contains_key(src),
-        None => false,
     }
 }
 
@@ -4960,13 +4861,7 @@ enum Statement<I, P: ast::ArgParams> {
     Constant(ConstantDefinition),
     RetValue(ast::RetData, spirv::Word),
     Undef(ast::Type, spirv::Word),
-    PtrAdd {
-        underlying_type: ast::PointerType,
-        state_space: ast::LdStateSpace,
-        dst: spirv::Word,
-        ptr_src: spirv::Word,
-        offset_src: spirv::Word,
-    },
+    PtrAccess(PtrAccess<P>),
 }
 
 impl ExpandedStatement {
@@ -5035,23 +4930,23 @@ impl ExpandedStatement {
                 let id = f(id, true);
                 Statement::Undef(typ, id)
             }
-            Statement::PtrAdd {
+            Statement::PtrAccess(PtrAccess {
                 underlying_type,
                 state_space,
                 dst,
                 ptr_src,
                 offset_src: constant_src,
-            } => {
+            }) => {
                 let dst = f(dst, true);
                 let ptr_src = f(ptr_src, false);
                 let constant_src = f(constant_src, false);
-                Statement::PtrAdd {
+                Statement::PtrAccess(PtrAccess {
                     underlying_type,
                     state_space,
                     dst,
                     ptr_src,
                     offset_src: constant_src,
-                }
+                })
             }
         }
     }
@@ -5153,6 +5048,70 @@ impl VisitVariableExpanded for ResolvedCall<ExpandedArgParams> {
         f: &mut F,
     ) -> Result<ExpandedStatement, TranslateError> {
         Ok(Statement::Call(self.map(f)?))
+    }
+}
+
+impl<P: ArgParamsEx<Id = spirv::Word>> PtrAccess<P> {
+    fn map<To: ArgParamsEx<Id = spirv::Word>, V: ArgumentMapVisitor<P, To>>(
+        self,
+        visitor: &mut V,
+    ) -> Result<PtrAccess<To>, TranslateError> {
+        let sema = match self.state_space {
+            ast::LdStateSpace::Const
+            | ast::LdStateSpace::Global
+            | ast::LdStateSpace::Shared
+            | ast::LdStateSpace::Generic => ArgumentSemantics::PhysicalPointer,
+            ast::LdStateSpace::Local | ast::LdStateSpace::Param => {
+                ArgumentSemantics::RegisterPointer
+            }
+        };
+        let ptr_type = ast::Type::Pointer(self.underlying_type.clone(), self.state_space);
+        let new_dst = visitor.id(
+            ArgumentDescriptor {
+                op: self.dst,
+                is_dst: true,
+                sema,
+            },
+            Some(&ptr_type),
+        )?;
+        let new_ptr_src = visitor.id(
+            ArgumentDescriptor {
+                op: self.ptr_src,
+                is_dst: false,
+                sema,
+            },
+            Some(&ptr_type),
+        )?;
+        let new_constant_src = visitor.operand(
+            ArgumentDescriptor {
+                op: self.offset_src,
+                is_dst: false,
+                sema: ArgumentSemantics::Default,
+            },
+            &ast::Type::Scalar(ast::ScalarType::S64),
+        )?;
+        Ok(PtrAccess {
+            underlying_type: self.underlying_type,
+            state_space: self.state_space,
+            dst: new_dst,
+            ptr_src: new_ptr_src,
+            offset_src: new_constant_src,
+        })
+    }
+}
+
+impl VisitVariable for PtrAccess<TypedArgParams> {
+    fn visit_variable<
+        'a,
+        F: FnMut(
+            ArgumentDescriptor<spirv::Word>,
+            Option<&ast::Type>,
+        ) -> Result<spirv::Word, TranslateError>,
+    >(
+        self,
+        f: &mut F,
+    ) -> Result<TypedStatement, TranslateError> {
+        Ok(Statement::PtrAccess(self.map(f)?))
     }
 }
 
@@ -5449,6 +5408,14 @@ pub struct ArgumentDescriptor<Op> {
     op: Op,
     is_dst: bool,
     sema: ArgumentSemantics,
+}
+
+pub struct PtrAccess<P: ast::ArgParams> {
+    underlying_type: ast::PointerType,
+    state_space: ast::LdStateSpace,
+    dst: spirv::Word,
+    ptr_src: spirv::Word,
+    offset_src: P::Operand,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
