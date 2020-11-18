@@ -4397,6 +4397,105 @@ fn convert_to_stateful_memory_access<'a>(
                     result.push(Statement::Variable(var));
                 }
             }
+            Statement::Instruction(ast::Instruction::Cvta(
+                ast::CvtaDetails {
+                    to: ast::CvtaStateSpace::Global,
+                    size: ast::CvtaSize::U64,
+                    from: ast::CvtaStateSpace::Generic,
+                },
+                arg,
+            )) if is_cvta_ptr_direct(&remapped_ids, &arg) => {
+                let new_dst = *remapped_ids.get(&arg.dst).unwrap();
+                let new_src = *remapped_ids.get(&arg.src.underlying().unwrap()).unwrap();
+                result.push(Statement::Instruction(ast::Instruction::Mov(
+                    ast::MovDetails {
+                        typ: ast::Type::Pointer(
+                            ast::PointerType::Scalar(ast::ScalarType::U8),
+                            ast::LdStateSpace::Global,
+                        ),
+                        src_is_address: false,
+                        dst_width: 0,
+                        src_width: 0,
+                        relaxed_src2_conv: false,
+                    },
+                    ast::Arg2Mov::Normal(ast::Arg2MovNormal {
+                        dst: ast::IdOrVector::Reg(new_dst),
+                        src: ast::OperandOrVector::Reg(new_src),
+                    }),
+                )));
+            }
+            Statement::Instruction(ast::Instruction::Ld(
+                details
+                @
+                ast::LdDetails {
+                    state_space: ast::LdStateSpace::Param,
+                    ..
+                },
+                arg,
+            )) if is_param_ld_ptr_direct(&remapped_ids, &func_args_ptr, &arg) => {
+                let new_dst = if let ast::IdOrVector::Reg(dst) = arg.dst {
+                    *remapped_ids.get(&dst).unwrap()
+                } else {
+                    return Err(TranslateError::Unreachable);
+                };
+                result.push(Statement::Instruction(ast::Instruction::Ld(
+                    ast::LdDetails {
+                        typ: ast::LdStType::Pointer(
+                            ast::PointerType::Scalar(ast::ScalarType::U8),
+                            ast::LdStateSpace::Global,
+                        ),
+                        ..details
+                    },
+                    ast::Arg2Ld {
+                        src: arg.src,
+                        dst: ast::IdOrVector::Reg(new_dst),
+                    },
+                )));
+            }
+            Statement::Instruction(ast::Instruction::Ld(
+                details
+                @
+                ast::LdDetails {
+                    state_space: ast::LdStateSpace::Global,
+                    ..
+                },
+                arg,
+            )) if is_ldst_global_ptr_direct(&remapped_ids, &arg.src) => {
+                let new_src = if let ast::Operand::Reg(src) = arg.src {
+                    *remapped_ids.get(&src).unwrap()
+                } else {
+                    return Err(TranslateError::Unreachable);
+                };
+                result.push(Statement::Instruction(ast::Instruction::Ld(
+                    details,
+                    ast::Arg2Ld {
+                        src: ast::Operand::Reg(new_src),
+                        ..arg
+                    },
+                )));
+            }
+            Statement::Instruction(ast::Instruction::St(
+                details
+                @
+                ast::StData {
+                    state_space: ast::StStateSpace::Global,
+                    ..
+                },
+                arg,
+            )) if is_ldst_global_ptr_direct(&remapped_ids, &arg.src1) => {
+                let new_src1 = if let ast::Operand::Reg(src1) = arg.src1 {
+                    *remapped_ids.get(&src1).unwrap()
+                } else {
+                    return Err(TranslateError::Unreachable);
+                };
+                result.push(Statement::Instruction(ast::Instruction::St(
+                    details,
+                    ast::Arg2St {
+                        src1: ast::Operand::Reg(new_src1),
+                        ..arg
+                    },
+                )));
+            }
             Statement::Instruction(inst) => {
                 let mut post_statements = Vec::new();
                 let new_statement =
@@ -4487,6 +4586,36 @@ fn convert_to_stateful_memory_access<'a>(
         }
     }
     Ok(result)
+}
+
+fn is_param_ld_ptr_direct(
+    remapped_ids: &HashMap<u32, u32>,
+    func_args_ptr: &HashSet<u32>,
+    arg: &ast::Arg2Ld<TypedArgParams>,
+) -> bool {
+    match (arg.src.underlying(), &arg.dst) {
+        (Some(src), ast::IdOrVector::Reg(dst)) => {
+            func_args_ptr.contains(src) && remapped_ids.contains_key(dst)
+        }
+        _ => false,
+    }
+}
+
+fn is_cvta_ptr_direct(remapped_ids: &HashMap<u32, u32>, arg: &ast::Arg2<TypedArgParams>) -> bool {
+    match arg.src.underlying() {
+        Some(src) => remapped_ids.contains_key(src) && remapped_ids.contains_key(&arg.dst),
+        None => false,
+    }
+}
+
+fn is_ldst_global_ptr_direct(
+    remapped_ids: &HashMap<u32, u32>,
+    src: &ast::Operand<spirv::Word>,
+) -> bool {
+    match src.underlying() {
+        Some(src) => remapped_ids.contains_key(src),
+        None => false,
+    }
 }
 
 fn is_64_bit_integer(id_defs: &NumericIdResolver, id: spirv::Word) -> bool {
