@@ -5,6 +5,7 @@ members = [
     "level_zero",
     "spirv_tools-sys",
     "zluda",
+    "zluda_dump",
     #"zluda_inject",
     #"zluda_redirect",
     "ptx",
